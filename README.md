@@ -200,7 +200,7 @@ curl -X POST http://18.118.46.122:8081/chaos/start?mode=error
 
 # 3. Verify automatic switch to Green (zero failures)
 for i in {1..20}; do
-  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/version
+  curl -s -o /dev/null -w "%{http_code}\n" http://18.118.46.122:8080/version
   sleep 0.5
 done
 # Should show: 200 (20 times, no 500s)

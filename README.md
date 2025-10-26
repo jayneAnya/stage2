@@ -1,143 +1,239 @@
-# Implementation Decisions & Reasoning
+# Blue/Green Deployment with Nginx Auto-Failover
 
-## Overview
+A Docker Compose-based blue/green deployment setup with automatic failover using Nginx reverse proxy.
 
-This document explains the key decisions made during implementation of the Blue/Green deployment system.
+## Architecture Overview
 
-## Architecture Decisions
-
-### 1. Static vs Dynamic Nginx Configuration
-
-**Decision**: Used a static nginx.conf with Blue as primary and Green as backup.
-
-**Reasoning**:
-- The task specifies "Blue is active by default" - this naturally maps to the primary/backup pattern
-- Nginx's `backup` directive is perfect for this use case
-- Simpler than templating - fewer moving parts means fewer failure points
-- The automatic failover handles the "switching" without manual config changes
-- Easy to understand and debug
-
-**Alternative Considered**: 
-- Using `envsubst` to template the active pool
-- Rejected because it adds complexity without real benefit for automatic failover
-
-### 2. Timeout Values
-
-**Decision**: 
-```nginx
-proxy_connect_timeout 2s;
-proxy_send_timeout 3s;
-proxy_read_timeout 3s;
+```
+┌─────────────┐
+│   Client    │
+└──────┬──────┘
+       │ :8080
+       ▼
+┌─────────────┐
+│   Nginx     │ ◄── Reverse Proxy + Load Balancer
+└──────┬──────┘
+       │
+   ┌───┴────┐
+   │        │
+   ▼        ▼
+┌──────┐ ┌──────┐
+│ Blue │ │Green │ ◄── Node.js Applications
+│:8081 │ │:8082 │
+└──────┘ └──────┘
 ```
 
-**Reasoning**:
-- Tight timeouts ensure failures are detected quickly (within single-digit seconds)
-- Task requires failover to happen "immediately"
-- 2-3 second timeouts strike a balance between:
-  - Fast enough to detect real failures
-  - Loose enough to avoid false positives on slow network
-- Total request time: 2s (connect) + 3s (read) = 5s max before retry
+## Features
 
-**Why not 1s?**: Too aggressive - could cause false positives under load
+- **Automatic Failover**: If Blue fails, traffic instantly switches to Green
+- **Zero Downtime**: Requests are retried to backup within the same client request
+- **Health Monitoring**: Nginx monitors upstream health automatically
+- **Manual Access**: Direct ports (8081/8082) for chaos testing
 
-**Why not 5s+?**: Too slow - task emphasizes "immediate" failover
+## Quick Start
 
-### 3. Failover Trigger Conditions
+### 1. Prerequisites
 
-**Decision**:
-```nginx
-proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
+- Docker & Docker Compose installed
+- Pre-built application images available
+
+### 2. Setup
+
+Copy the environment template and configure it:
+
+```bash
+cp .env.example .env
 ```
 
-**Reasoning**:
-- `error` - catches connection failures
-- `timeout` - catches slow/hanging responses
-- `http_5xx` - catches application errors (chaos mode returns 500)
-- Covers all failure modes mentioned in the task
-- Does NOT retry on 4xx (client errors) - those should propagate
+Edit `.env` with your actual values:
 
-### 4. max_fails and fail_timeout
-
-**Decision**:
-```nginx
-server app_blue:3000 max_fails=2 fail_timeout=10s;
+```bash
+BLUE_IMAGE=ghcr.io/yourorg/app:blue
+GREEN_IMAGE=ghcr.io/yourorg/app:green
+RELEASE_ID_BLUE=blue-v1.0.0
+RELEASE_ID_GREEN=green-v1.0.0
 ```
 
-**Reasoning**:
-- `max_fails=2` - Two strikes and you're out. Not too aggressive (avoids marking healthy servers down on transient issues), not too lenient (reacts quickly)
-- `fail_timeout=10s` - Short enough to recover quickly, long enough to avoid flapping
-- After 10s, Nginx will try Blue again (automatic recovery)
+### 3. Start Services
 
-### 5. Port Mapping Strategy
-
-**Decision**:
-```yaml
-nginx:
-  ports: ["8080:80"]
-app_blue:
-  ports: ["8081:3000"]
-app_green:
-  ports: ["8082:3000"]
+```bash
+docker-compose up -d
 ```
 
-**Reasoning**:
-- 8080 - Standard HTTP alt port, main entry point
-- 8081/8082 - Direct app access for chaos testing (task requirement)
-- Internal apps run on 3000 (typical Node.js convention)
-- Clean separation: public (8080) vs testing (8081/8082)
+Check everything is running:
 
-### 6. Docker Network
-
-**Decision**: Single custom bridge network `app_network`
-
-**Reasoning**:
-- All containers need to communicate
-- Custom network provides:
-  - DNS resolution (app_blue, app_green, nginx)
-  - Network isolation from other Docker projects
-  - Predictable container naming
-- Bridge driver is lightweight and sufficient for single-host deployment
-
-### 7. Health Checks in Docker Compose
-
-**Decision**: Added healthcheck to app containers
-
-```yaml
-healthcheck:
-  test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/healthz"]
-  interval: 10s
-  timeout: 3s
+```bash
+docker-compose ps
 ```
 
-**Reasoning**:
-- Provides visibility in `docker-compose ps`
-- Ensures containers are actually ready before Nginx tries them
-- Aligns with Nginx's health checking
-- `wget` is available in most base images (lightweight)
+### 4. Test Normal Operation
 
-**Note**: This is Docker-level health checking. Nginx does its own application-level checks.
-
-### 8. Header Forwarding
-
-**Decision**: Rely on Nginx's default header forwarding behavior
-
-**Reasoning**:
-- By default, Nginx forwards response headers from upstream
-- No need to explicitly add or manipulate headers
-- Simpler config = fewer bugs
-- Headers `X-App-Pool` and `X-Release-Id` come from the app, we just pass them through
-
-**Avoided**: Using `add_header` or `proxy_set_header` for response headers - these would override app headers
-
-### 9. Environment Variable Strategy
-
-**Decision**: Pass env vars directly to containers
-
-```yaml
-environment:
-  - APP_POOL=blue
-  - RELEASE_ID=${RELEASE_ID_BLUE}
+```bash
+curl http://18.118.46.122:8080/version
 ```
 
-**Reasoning**:
-- Apps
+Expected response:
+```json
+{
+  "version": "1.0.0",
+  "pool": "blue"
+}
+```
+
+Headers should include:
+- `X-App-Pool: blue`
+- `X-Release-Id: blue-v1.0.0`
+
+### 5. Test Failover
+
+Trigger chaos on Blue:
+
+```bash
+curl -X POST http://18.118.46.122:8081/chaos/start?mode=error
+```
+
+Now test the main endpoint:
+
+```bash
+# Should still return 200, but from Green
+curl http://18.118.46.122:8080/version
+```
+
+Expected response:
+```json
+{
+  "version": "1.0.0",
+  "pool": "green"
+}
+```
+
+Headers should now show:
+- `X-App-Pool: green`
+- `X-Release-Id: green-v1.0.0`
+
+### 6. Stop Chaos
+
+```bash
+curl -X POST http://18.118.46.122:8081/chaos/stop
+```
+
+After ~10 seconds (fail_timeout), Blue will be back in rotation.
+
+## Configuration Details
+
+### Nginx Failover Settings
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `max_fails` | 2 | Mark server down after 2 failures |
+| `fail_timeout` | 10s | Wait 10s before retrying failed server |
+| `proxy_connect_timeout` | 2s | Fast connection timeout |
+| `proxy_read_timeout` | 3s | Fast read timeout |
+| `proxy_next_upstream` | error, timeout, http_5xx | Conditions to try backup |
+
+### Port Mapping
+
+| Service | Internal | External | Purpose |
+|---------|----------|----------|---------|
+| Nginx | 80 | 8080 | Main entry point |
+| Blue | 3000 | 8081 | Primary app + chaos control |
+| Green | 3000 | 8082 | Backup app + chaos control |
+
+## API Endpoints
+
+### Main Service (via Nginx :8080)
+
+- `GET /version` - Returns app version and pool info
+- `GET /healthz` - Health check endpoint
+
+### Direct Access (Blue :8081, Green :8082)
+
+- `POST /chaos/start?mode=error` - Simulate 500 errors
+- `POST /chaos/start?mode=timeout` - Simulate timeouts
+- `POST /chaos/stop` - Stop chaos simulation
+
+## Monitoring
+
+View Nginx logs:
+```bash
+docker-compose logs -f nginx
+```
+
+View application logs:
+```bash
+docker-compose logs -f app_blue app_green
+```
+
+## Troubleshooting
+
+### Blue stays down after chaos stop
+
+Wait for `fail_timeout` (10s) to expire. Nginx will automatically retry.
+
+### Both services failing
+
+Check if images are pulled correctly:
+```bash
+docker-compose pull
+```
+
+### Headers not showing up
+
+Verify with verbose curl:
+```bash
+curl -v http://18.118.46.122:8080/version
+```
+
+## Testing Scenario
+
+Here's a complete test flow:
+
+```bash
+# 1. Verify Blue is active
+for i in {1..5}; do
+  curl -s http://18.118.46.122:8080/version | grep -o '"pool":"[^"]*"'
+done
+# Should show: "pool":"blue" (5 times)
+
+# 2. Break Blue
+curl -X POST http://18.118.46.122:8081/chaos/start?mode=error
+
+# 3. Verify automatic switch to Green (zero failures)
+for i in {1..20}; do
+  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/version
+  sleep 0.5
+done
+# Should show: 200 (20 times, no 500s)
+
+# 4. Check all responses are from Green
+for i in {1..5}; do
+  curl -s http://18.118.46.122:8080/version | grep -o '"pool":"[^"]*"'
+done
+# Should show: "pool":"green" (5 times)
+
+# 5. Restore Blue
+curl -X POST http://18.118.46.122:8081/chaos/stop
+
+# 6. Wait and verify Blue returns
+sleep 12
+curl -s http://18.118.46.122:8080/version | grep -o '"pool":"[^"]*"'
+# Should show: "pool":"blue"
+```
+
+## Cleanup
+
+Stop and remove everything:
+
+```bash
+docker-compose down
+```
+
+Remove volumes (if any):
+
+```bash
+docker-compose down -v
+```
+
+## License
+
+MIT

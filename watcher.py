@@ -2,7 +2,6 @@
 import os
 import time
 import re
-import json
 import requests
 from collections import deque
 from datetime import datetime
@@ -28,23 +27,21 @@ class LogWatcher:
         self.last_pool = None
         self.request_window = deque(maxlen=self.window_size)
         self.last_alert_time = {}
+        self.last_file_position = 0
+        self.file_checked = False
         
-        # Enhanced log pattern for nginx custom format
+        # Log pattern for nginx custom format
         self.log_pattern = re.compile(
             r'pool=(?P<pool>\S+)\s+'
             r'release=(?P<release>\S+)\s+'
             r'upstream_status=(?P<upstream_status>\S+)\s+'
             r'upstream_addr=(?P<upstream_addr>[\d\.:]+)\s+'
             r'request_time=(?P<request_time>[\d\.]+)\s+'
-            r'upstream_response_time=(?P<upstream_response_time>[\d\.]+)\s+'
-            r'remote_addr=(?P<remote_addr>\S+)\s+'
-            r'status=(?P<status>\d+)\s+'
-            r'request="(?P<request>.*?)"'
+            r'upstream_response_time=(?P<upstream_response_time>[\d\.]+)'
         )
         
         logger.info(f"LogWatcher initialized: threshold={self.error_threshold}%, "
-                   f"window={self.window_size}, cooldown={self.cooldown_sec}s, "
-                   f"active_pool={self.active_pool}")
+                   f"window={self.window_size}, cooldown={self.cooldown_sec}s")
 
     def parse_log_line(self, line):
         """Parse nginx log line and extract relevant fields"""
@@ -99,21 +96,21 @@ class LogWatcher:
 
         # Determine alert color and emoji based on type
         if "FAILOVER" in alert_type:
-            color = "#FF0000"  # Red
+            color = "danger"
             icon_emoji = ":arrows_counterclockwise:"
             title = "Failover Detected"
         else:
-            color = "#FFA500"  # Orange
+            color = "warning"
             icon_emoji = ":chart_with_upwards_trend:"
             title = "High Error Rate"
 
         payload = {
+            "text": f"{icon_emoji} {title}",
             "username": "Blue-Green Monitor",
             "icon_emoji": icon_emoji,
             "attachments": [
                 {
                     "color": color,
-                    "title": title,
                     "text": message,
                     "fields": [
                         {
@@ -122,13 +119,12 @@ class LogWatcher:
                             "short": True
                         },
                         {
-                            "title": "Active Pool",
+                            "title": "Environment",
                             "value": self.active_pool,
                             "short": True
                         }
                     ],
-                    "footer": "Blue-Green Deployment Monitor",
-                    "ts": time.time()
+                    "footer": "Blue-Green Deployment Monitor"
                 }
             ]
         }
@@ -145,7 +141,7 @@ class LogWatcher:
                 logger.info(f"Slack alert sent: {alert_type}")
                 return True
             else:
-                logger.error(f"Slack API error: {response.status_code} - {response.text}")
+                logger.error(f"Slack API error: {response.status_code}")
                 return False
         except Exception as e:
             logger.error(f"Failed to send Slack alert: {e}")
@@ -159,11 +155,11 @@ class LogWatcher:
             self.last_pool != 'unknown'):
             
             failover_type = f"{self.last_pool.upper()}_TO_{current_pool.upper()}"
-            message = f"*Failover Event Detected*\n\n"
-            message += f"• *From:* `{self.last_pool}`\n"
-            message += f"• *To:* `{current_pool}`\n"
-            message += f"• *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
-            message += "_Action Required:_ Check health of primary container and investigate root cause."
+            message = f"Traffic has failed over from *{self.last_pool}* to *{current_pool}*\n\n"
+            message += "This usually indicates issues with the primary pool. Please check:\n"
+            message += "• Container health and logs\n"
+            message += "• Resource utilization\n"
+            message += "• Application errors"
             
             if self.send_slack_alert(message, f"FAILOVER_{failover_type}"):
                 logger.info(f"Failover detected: {self.last_pool} -> {current_pool}")
@@ -178,12 +174,9 @@ class LogWatcher:
         error_rate = self.calculate_error_rate()
         
         if error_rate > self.error_threshold:
-            message = f"*High Error Rate Detected*\n\n"
-            message += f"• *Current Rate:* `{error_rate:.1f}%`\n"
-            message += f"• *Threshold:* `{self.error_threshold}%`\n"
-            message += f"• *Window Size:* `{self.window_size}` requests\n"
-            message += f"• *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
-            message += "_Action Required:_ Investigate upstream service logs and health status."
+            message = f"Error rate has exceeded threshold: *{error_rate:.1f}%* (threshold: {self.error_threshold}%)\n\n"
+            message += f"Window: {len(self.request_window)} requests\n"
+            message += "Please investigate upstream services for issues."
             
             if self.send_slack_alert(message, "HIGH_ERROR_RATE"):
                 logger.warning(f"High error rate alert: {error_rate:.1f}%")
@@ -200,62 +193,81 @@ class LogWatcher:
         status = data.get('upstream_status', '000')
         
         # Update request window for error rate calculation
-        if status.isdigit():
-            self.request_window.append(status)
+        self.request_window.append(status)
         
         # Detect failover
         if pool != 'unknown':
             self.detect_failover(pool)
             self.last_pool = pool
         
-        # Monitor error rate periodically (every 10 requests to reduce load)
+        # Monitor error rate (check every 10 requests to reduce load)
         if len(self.request_window) % 10 == 0:
             self.monitor_error_rate()
 
-    def wait_for_log_file(self, log_file_path, timeout=30):
-        """Wait for log file to be created"""
-        start_time = time.time()
-        while not os.path.exists(log_file_path):
-            if time.time() - start_time > timeout:
-                logger.error(f"Log file not found after {timeout} seconds: {log_file_path}")
-                return False
-            logger.info(f"Waiting for log file: {log_file_path}")
-            time.sleep(2)
-        return True
-
-    def tail_log_file(self, log_file_path):
-        """Tail the log file and process new lines"""
-        if not self.wait_for_log_file(log_file_path):
-            return
-
+    def read_new_lines(self, log_file_path):
+        """Read new lines from log file using polling"""
         try:
+            if not os.path.exists(log_file_path):
+                if not self.file_checked:
+                    logger.info(f"Waiting for log file: {log_file_path}")
+                    self.file_checked = True
+                return []
+            
             with open(log_file_path, 'r') as file:
-                # Go to end of file
-                file.seek(0, 2)
+                # Get current file size
+                file.seek(0, 2)  # Seek to end
+                current_size = file.tell()
                 
-                while True:
-                    line = file.readline()
-                    if line:
-                        self.process_log_line(line)
-                    else:
-                        time.sleep(0.1)
-        except FileNotFoundError:
-            logger.error(f"Log file disappeared: {log_file_path}")
-            time.sleep(5)
+                # If file was rotated or we haven't started reading
+                if current_size < self.last_file_position:
+                    self.last_file_position = 0
+                    logger.info("Log file rotated, resetting position")
+                
+                # If no new data, return empty
+                if current_size <= self.last_file_position:
+                    return []
+                
+                # Read new data
+                file.seek(self.last_file_position)
+                new_lines = file.readlines()
+                self.last_file_position = file.tell()
+                
+                return new_lines
+                
         except Exception as e:
             logger.error(f"Error reading log file: {e}")
-            time.sleep(5)
+            return []
 
     def run(self):
-        """Main monitoring loop"""
+        """Main monitoring loop using polling"""
         log_file_path = '/var/log/nginx/access.log'
-        logger.info(f"Starting log watcher on {log_file_path}")
+        logger.info(f"Starting log watcher with polling on {log_file_path}")
         
+        # Initial wait for nginx to start logging
+        time.sleep(5)
+        
+        poll_count = 0
         while True:
             try:
-                self.tail_log_file(log_file_path)
+                # Read new lines
+                new_lines = self.read_new_lines(log_file_path)
+                
+                # Process each new line
+                for line in new_lines:
+                    line = line.strip()
+                    if line:
+                        self.process_log_line(line)
+                
+                # Log status periodically
+                poll_count += 1
+                if poll_count % 60 == 0:  # Every ~30 seconds
+                    logger.info(f"Monitoring active. Window size: {len(self.request_window)}")
+                
+                # Sleep before next poll
+                time.sleep(0.5)  # Poll twice per second
+                
             except Exception as e:
-                logger.error(f"Watcher error: {e}")
+                logger.error(f"Error in main loop: {e}")
                 time.sleep(5)
 
 if __name__ == '__main__':
